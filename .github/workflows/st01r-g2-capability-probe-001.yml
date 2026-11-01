@@ -1,0 +1,204 @@
+name: ST-01R G2 Capability Probe 001
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  capability-probe:
+    name: Ubuntu 24.04 transient cgroup and nft syntax probe
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Inventory capabilities and emit receipt
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import glob
+          import hashlib
+          import ipaddress
+          import json
+          import os
+          import pathlib
+          import re
+          import shutil
+          import subprocess
+          import sys
+          import tempfile
+          import textwrap
+
+          EXPECTED_POLICY_SHA256 = "0dfbf2c77385e894b433e1ccc925fec035661a74db669cd67b533c468d9546e3"
+          NFT_POLICY = textwrap.dedent("""\
+          # Canonical source template. UID must be replaced with the
+          # numeric UID resolved after user creation; no live rule is applied by this bundle.
+          table inet watson_s1_egress {
+            chain output { type filter hook output priority 0; policy accept;
+              meta skuid __WATSON_S1_UID__ jump collector
+            }
+            chain collector {
+              ip daddr 127.0.0.53 udp dport 53 counter accept
+              ip daddr 127.0.0.53 tcp dport 53 counter accept
+              ip daddr 169.254.0.0/16 counter reject
+              ip6 daddr fe80::/10 counter reject
+              ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } counter reject
+              ip6 daddr { ::1, fc00::/7 } counter reject
+              tcp dport 443 counter accept
+              counter reject
+            }
+          }
+          """)
+
+          receipt = {"probe":"ST-01R G2 Capability Probe 001","status":"PASS","runner":{},"host":{},"checks":{},"commands":{}}
+          blocked, partial = [], []
+
+          def run(name, argv, timeout=15):
+              try:
+                  p = subprocess.run(argv, text=True, capture_output=True, timeout=timeout, check=False)
+                  item = {"argv":argv,"exit_code":p.returncode,"stdout":p.stdout.strip(),"stderr":p.stderr.strip()}
+              except Exception as exc:
+                  item = {"argv":argv,"exit_code":None,"stdout":"","stderr":type(exc).__name__+": "+str(exc)}
+              receipt["commands"][name] = item
+              return item
+
+          def read(path):
+              try: return pathlib.Path(path).read_text(encoding="utf-8").strip()
+              except Exception: return None
+
+          def runner_version():
+              for key in ("ACTIONS_RUNNER_VERSION","RUNNER_VERSION"):
+                  v = os.environ.get(key,"")
+                  if re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+",v): return v,"environment:"+key
+              pid = os.getppid()
+              for _ in range(10):
+                  try:
+                      exe = os.readlink("/proc/"+str(pid)+"/exe")
+                      m = re.search(r"(?<![0-9])([0-9]+\.[0-9]+\.[0-9]+)(?![0-9])",exe)
+                      if m: return m.group(1),"runner process executable path"
+                      status = pathlib.Path("/proc/"+str(pid)+"/status").read_text()
+                      next_pid = int(next(x for x in status.splitlines() if x.startswith("PPid:")).split()[1])
+                      if next_pid <= 1 or next_pid == pid: break
+                      pid = next_pid
+                  except Exception: break
+              roots = [pathlib.Path("/home/runner/runners"),pathlib.Path(os.environ.get("RUNNER_TEMP","/nonexistent")).parent]
+              for root in roots:
+                  try:
+                      for f in root.glob("*/_diag/Runner_*.log"):
+                          s = f.read_text(errors="replace")[-1000000:]
+                          versions = re.findall(r"Current runner version:\s*['\"]?([0-9]+\.[0-9]+\.[0-9]+)",s)
+                          if versions: return versions[-1],"runner diagnostic version marker"
+                  except Exception: pass
+              return None,"not exposed"
+
+          version, source = runner_version()
+          receipt["runner"] = {"os":os.environ.get("RUNNER_OS"),"arch":os.environ.get("RUNNER_ARCH"),"image_os":os.environ.get("ImageOS"),"image_version":os.environ.get("ImageVersion"),"software_version":version,"software_version_source":source}
+          if not version: partial.append("GitHub runner software version unavailable")
+          if not receipt["runner"]["image_version"]: partial.append("GitHub runner image version unavailable")
+
+          k = run("kernel",["uname","-a"])
+          receipt["host"]["kernel"] = k["stdout"]
+          osr = {}
+          try:
+              for line in pathlib.Path("/etc/os-release").read_text().splitlines():
+                  if "=" in line:
+                      a,b = line.split("=",1); osr[a]=b.strip().strip('"')
+          except Exception as exc: receipt["host"]["os_release_error"]=type(exc).__name__
+          receipt["host"]["os_release"]=osr
+          sd=run("systemd",["systemctl","--version"])
+          ba=run("bash",["bash","--version"])
+          py=run("python",["python3","--version"])
+          receipt["host"]["systemd"]=sd["stdout"].splitlines()[:1]
+          receipt["host"]["bash"]=ba["stdout"].splitlines()[:1]
+          receipt["host"]["python"]=py["stdout"]
+          if k["exit_code"]!=0 or sd["exit_code"]!=0 or ba["exit_code"]!=0 or py["exit_code"]!=0: blocked.append("required runtime inventory command failed")
+          if osr.get("ID")!="ubuntu" or osr.get("VERSION_ID")!="24.04": blocked.append("runner OS is not Ubuntu 24.04")
+
+          cg = read("/sys/fs/cgroup/cgroup.controllers")
+          pcg = read("/proc/self/cgroup")
+          mounts = read("/proc/mounts") or ""
+          v2 = any(len(x.split())>2 and x.split()[2]=="cgroup2" for x in mounts.splitlines())
+          ctrls = set((cg or "").split())
+          receipt["host"]["cgroup"]={"v2_mount_detected":v2,"available_controllers":sorted(ctrls),"memory_available":"memory" in ctrls,"cpu_available":"cpu" in ctrls,"process_cgroup":pcg}
+          if not v2 or not pcg or not pcg.startswith("0::"): blocked.append("unified cgroup v2 not confirmed")
+          if not {"memory","cpu"}.issubset(ctrls): blocked.append("memory/cpu controllers unavailable")
+
+          probe = (
+              "import json,pathlib,os\n"
+              "row=next((x for x in pathlib.Path('/proc/self/cgroup').read_text().splitlines() if x.startswith('0::')),None)\n"
+              "rel=row.split('::',1)[1] if row else None\n"
+              "base=pathlib.Path('/sys/fs/cgroup')/(rel.lstrip('/') if rel else '__missing__')\n"
+              "def rd(n):\n p=base/n\n return p.read_text().strip() if p.is_file() else None\n"
+              "print(json.dumps({'proc_self_cgroup':row,'cgroup_path':rel,'memory_max':rd('memory.max'),'cpu_max':rd('cpu.max'),'pids_max':rd('pids.max'),'expected_unit':os.environ.get('ST01R_EXPECTED_UNIT')}))\n"
+          )
+          with tempfile.TemporaryDirectory(prefix="st01r-g2-") as td:
+              pp=pathlib.Path(td)/"read_self_cgroup.py"; pp.write_text(probe,encoding="utf-8")
+              rid=re.sub(r"[^0-9]","",os.environ.get("GITHUB_RUN_ID","0")) or "0"
+              att=re.sub(r"[^0-9]","",os.environ.get("GITHUB_RUN_ATTEMPT","1")) or "1"
+              unit="st01r-g2-capability-"+rid+"-"+att+".service"
+              argv=["sudo","-n","systemd-run","--system","--wait","--pipe","--collect","--unit="+unit,"--property=Type=exec","--property=MemoryMax=536870912","--property=CPUQuota=60%","--property=TasksMax=16","--setenv=ST01R_EXPECTED_UNIT="+unit,"/usr/bin/python3",str(pp)]
+              ur=run("transient_systemd_unit",argv,timeout=75); payload=None
+              for text in (ur["stdout"],ur["stderr"]):
+                  for line in text.splitlines():
+                      if line.startswith("{") and line.endswith("}"):
+                          try: payload=json.loads(line)
+                          except Exception: pass
+              checks={"unit_name":unit,"command_exit_code":ur["exit_code"],"readback":payload}
+              receipt["checks"]["transient_unit"]=checks
+              if ur["exit_code"]!=0 or not isinstance(payload,dict): blocked.append("transient systemd unit failed or returned no cgroup receipt")
+              else:
+                  fields=(payload.get("cpu_max") or "").split()
+                  try: cpu_ok=len(fields)==2 and int(fields[0])==60000 and int(fields[1])==100000
+                  except Exception: cpu_ok=False
+                  good=payload.get("memory_max")=="536870912" and cpu_ok and payload.get("pids_max")=="16" and payload.get("expected_unit")==unit and unit in (payload.get("cgroup_path") or "")
+                  checks["limits_match"]=good
+                  if not good: blocked.append("transient unit cgroup readback differs from expected limits/path")
+
+          policy_sha=hashlib.sha256(NFT_POLICY.encode("utf-8")).hexdigest()
+          nft_check={"sha256":policy_sha,"expected_sha256":EXPECTED_POLICY_SHA256}
+          receipt["checks"]["nft_policy"]=nft_check
+          if policy_sha!=EXPECTED_POLICY_SHA256: blocked.append("embedded nft policy bytes mismatch pinned R4 SHA256")
+          nft=shutil.which("nft")
+          if not nft:
+              nft_check["result"]="PARTIAL_NFT_NOT_INSTALLED"; partial.append("nft absent; no packages installed")
+          elif policy_sha==EXPECTED_POLICY_SHA256:
+              if NFT_POLICY.count("__WATSON_S1_UID__")!=1:
+                  blocked.append("nft UID marker count not exactly one"); nft_check["result"]="BLOCKED_UID_MARKER_COUNT"
+              else:
+                  uid=str(os.getuid()); tmp=pathlib.Path(tempfile.gettempdir())/"st01r-g2-policy-check.nft"
+                  tmp.write_text(NFT_POLICY.replace("__WATSON_S1_UID__",uid),encoding="utf-8")
+                  nr=run("nft_syntax_check",["sudo","-n",nft,"-c","-f",str(tmp)],timeout=20)
+                  tmp.unlink(missing_ok=True); nft_check["syntax_check_exit_code"]=nr["exit_code"]
+                  nft_check["result"]="PASS" if nr["exit_code"]==0 else "FAIL"
+                  if nr["exit_code"]!=0: blocked.append("nft -c syntax check failed")
+
+          disable=read("/proc/sys/net/ipv6/conf/all/disable_ipv6")
+          ifinet=read("/proc/net/if_inet6")
+          ip=shutil.which("ip")
+          if ip:
+              ia=run("ipv6_addresses",[ip,"-6","addr","show"])
+              ir=run("ipv6_routes",[ip,"-6","route","show"])
+          else:
+              ia={"exit_code":None,"stdout":"","stderr":"ip command absent"}; ir={"exit_code":None,"stdout":"","stderr":"ip command absent"}
+              receipt["commands"]["ipv6_addresses"]=ia; receipt["commands"]["ipv6_routes"]=ir
+          links=[]
+          for line in (ifinet or "").splitlines():
+              f=line.split()
+              if len(f)>=6:
+                  try:
+                      if ipaddress.IPv6Address(int(f[0],16)).is_link_local: links.append(f[5])
+                  except Exception: pass
+          state="IPV6_STATE_UNKNOWN"
+          if disable=="1": state="IPV6_DISABLED"
+          elif disable=="0" and links: state="IPV6_ENABLED_LINKLOCAL_PRESENT"
+          elif disable=="0" and ifinet is None: state="IPV6_ENABLED_NO_IF_INET6_DATA"
+          elif disable=="0": state="IPV6_ENABLED_NO_LINKLOCAL"
+          receipt["host"]["ipv6"]={"disable_ipv6_all":disable,"state":state,"link_local_interfaces":sorted(set(links)),"address_exit_code":ia["exit_code"],"route_exit_code":ir["exit_code"],"route_output":ir["stdout"]}
+          receipt["checks"]["ipv6"]="RECORDED_ONLY_NO_NETWORK_CHANGE"
+          if state=="IPV6_STATE_UNKNOWN" or ia["exit_code"]!=0 or ir["exit_code"]!=0: partial.append("IPv6 inventory incomplete")
+
+          receipt["status"]="BLOCKED" if blocked else ("PARTIAL" if partial else "PASS")
+          receipt["reasons"]={"blocked":blocked,"partial":partial}
+          receipt["criteria"]={"PASS":"Ubuntu 24.04; cgroup v2 memory+cpu; exact transient memory.max=536870912, cpu.max=60000 100000, pids.max=16 and unit path; pinned policy SHA plus nft -c pass; runner software/image version and IPv6 inventory recorded.","PARTIAL":"nft absent, runner/image version unavailable, or IPv6 inventory incomplete; no install and never implicit PASS.","BLOCKED":"wrong OS/cgroup, failed transient unit or mismatched limits, policy SHA mismatch, or nft syntax-check failure."}
+          print(json.dumps(receipt,indent=2,sort_keys=True))
+          sys.exit(0 if receipt["status"]=="PASS" else 1)
+          PY
