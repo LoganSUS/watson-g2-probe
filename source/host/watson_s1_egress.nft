@@ -1,0 +1,17 @@
+# Canonical source template. UID must be replaced with the
+# numeric UID resolved after user creation; no live rule is applied by this bundle.
+table inet watson_s1_egress {
+  chain output { type filter hook output priority 0; policy accept;
+    meta skuid __WATSON_S1_UID__ jump collector
+  }
+  chain collector {
+    ip daddr 127.0.0.53 udp dport 53 counter accept
+    ip daddr 127.0.0.53 tcp dport 53 counter accept
+    ip daddr 169.254.0.0/16 counter reject
+    ip6 daddr fe80::/10 counter reject
+    ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } counter reject
+    ip6 daddr { ::1, fc00::/7 } counter reject
+    tcp dport 443 counter accept
+    counter reject
+  }
+}

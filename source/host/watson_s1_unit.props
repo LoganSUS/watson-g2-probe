@@ -1,0 +1,14 @@
+# ST-01R v3 canonical temporary-unit properties; runtime limit is supplied per test invocation.
+User=watson-s1
+Group=watson-s1
+MemoryMax=536870912
+CPUQuota=60%
+TasksMax=16
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/watson-s1/runs
+WorkingDirectory=/opt/watson-s1
+Environment=WATSON_S1_OUTPUT_ROOT=/var/lib/watson-s1/runs
+Environment=PYTHONDONTWRITEBYTECODE=1

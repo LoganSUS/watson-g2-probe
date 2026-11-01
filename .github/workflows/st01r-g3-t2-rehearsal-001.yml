@@ -1,0 +1,247 @@
+name: ST-01R G3 T2 rehearsal (isolated)
+
+on:
+  workflow_dispatch:
+    inputs:
+      attempt_id:
+        description: UUID recorded in the separate owner GO; this workflow does not grant GO
+        required: true
+        type: string
+      owner_go_confirmed:
+        description: Confirm that a separate, current owner GO exists for this exact attempt ID
+        required: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: st01r-g3-t2-rehearsal-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  rehearsal:
+    if: github.event_name == 'workflow_dispatch' && github.run_attempt == 1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      ATTEMPT_ID: ${{ inputs.attempt_id }}
+      OWNER_GO_CONFIRMED: ${{ inputs.owner_go_confirmed }}
+      EXPECTED_NFT_SHA256: 0dfbf2c77385e894b433e1ccc925fec035661a74db669cd67b533c468d9546e3
+      EXPECTED_PROPS_SHA256: ceef5df0da3042138aad54c39d58914017f37f2f5fc20402bbb44c04066f8b87
+      EXPECTED_MEMORY_MAX_BYTES: '536870912'
+      EXPECTED_CPU_QUOTA: '60%'
+      EXPECTED_CPU_MAX: '60000 100000' 
+    steps:
+      - name: Checkout reviewed repository content only
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Fail-closed host and exact component hash preflight
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          block() { echo "G3_STATUS=BLOCKED REASON=$1"; exit 20; }
+          [[ "$OWNER_GO_CONFIRMED" == "true" ]] || block OWNER_GO_NOT_CONFIRMED
+          [[ "$ATTEMPT_ID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$ ]] || block ATTEMPT_ID_NOT_UUID
+          [[ "${GITHUB_RUN_ATTEMPT:-}" == 1 ]] || block WORKFLOW_RERUN
+          [[ "${RUNNER_ENVIRONMENT:-}" == github-hosted ]] || block NOT_GITHUB_HOSTED
+          [[ "${ImageOS:-}" == ubuntu24 ]] || block IMAGEOS_NOT_UBUNTU24
+          . /etc/os-release
+          [[ "$ID" == ubuntu && "$VERSION_ID" == 24.04 ]] || block OS_NOT_UBUNTU_24_04
+          [[ "$(ps -p 1 -o comm= | tr -d ' ')" == systemd ]] || block SYSTEMD_NOT_PID1
+          [[ "$(stat -fc %T /sys/fs/cgroup)" == cgroup2fs ]] || block CGROUP_V2_MISSING
+          controllers="$(cat /sys/fs/cgroup/cgroup.controllers)"
+          for c in cpu memory pids; do grep -qw "$c" <<<"$controllers" || block "CGROUP_CONTROLLER_MISSING_$c"; done
+          [[ "$(python3 -V 2>&1)" == "Python 3.12.3" ]] || block PYTHON_NOT_3_12_3
+          command -v nft >/dev/null || block NFT_MISSING_NO_INSTALL
+          command -v systemd-run >/dev/null || block SYSTEMD_RUN_MISSING
+          command -v systemctl >/dev/null || block SYSTEMCTL_MISSING
+          sudo -n true || block RUNNER_SUDO_UNAVAILABLE
+          [[ "$(readlink -f /etc/resolv.conf)" == /run/systemd/resolve/stub-resolv.conf ]] || block DNS_STUB_PATH_MISMATCH
+          grep -qE '^[[:space:]]*nameserver[[:space:]]+127\.0\.0\.53([[:space:]]|$)' /etc/resolv.conf || block DNS_STUB_ADDRESS_MISMATCH
+          echo "PREFLIGHT_PASS utc=$(date -u +%Y-%m-%dT%H:%M:%SZ) kernel=$(uname -r) os=$PRETTY_NAME systemd=$(systemctl --version | head -n1) bash=$BASH_VERSION python=$(python3 -V 2>&1) runner=${ImageOS}/${ImageVersion:-UNKNOWN} cgroup=2 controllers=$controllers limits=MemoryMax:536870912,CPUQuota:60%,TasksMax:16 ipv6_disabled=$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6)"
+          python3 - <<'PY'
+          import ast,hashlib,pathlib,os
+          files={
+           'source/host/probes/cgroup_utils.py':'2cfb4860818c1dec6105838fd4718172abed856a8d9b7c2372f3fe342fb9432d',
+           'source/host/probes/cgroup_probe.py':'aee3ef7e619c1ca95b2750991acba002bdb4bfc07cf2e1a3b5985a508c61f443',
+           'source/host/probes/memory_probe.py':'a1accbed3f50d8f04f5e56608e57b1e5d9ea281513c7169c132063e28bb1f461',
+           'source/host/probes/cpu_probe.py':'2ff29460d2c0bd75b1326b5278048d70e485ce087b8c58c2780180f844b7138e',
+           'source/host/probes/network_probe.py':'b8404cfe074c6cd2b3a901222c4c401455e66e851e192144c10e95ca20db7133',
+           'source/host/probes/nft_rules.py':'98bf733ad2e2f0f73d9478e7ef915c16be489b259df359d5b3fee7c5af5f20c9',
+           'source/host/probes/unit_runner.py':'5c47b97c75961c7d2ee0316991a16fd1da07190af7628becb1b2165487959383',
+           'source/host/watson_s1_egress.nft':os.environ['EXPECTED_NFT_SHA256'],
+           'source/host/watson_s1_unit.props':os.environ['EXPECTED_PROPS_SHA256']}
+          for name,want in files.items():
+              p=pathlib.Path(name)
+              if not p.is_file() or hashlib.sha256(p.read_bytes()).hexdigest()!=want: raise SystemExit('INPUT_SHA_MISMATCH:'+name)
+              raw=p.read_bytes()
+              if p.suffix in {'.py','.nft','.props'} and b'\r' in raw: raise SystemExit('INPUT_CR_BYTE:'+name)
+              if p.suffix=='.py': ast.parse(raw.decode('utf-8'),filename=name)
+          props=pathlib.Path('source/host/watson_s1_unit.props').read_text(encoding='utf-8')
+          required=['MemoryMax='+os.environ['EXPECTED_MEMORY_MAX_BYTES'],'CPUQuota='+os.environ['EXPECTED_CPU_QUOTA'],'TasksMax=16']
+          if any(row not in props.splitlines() for row in required): raise SystemExit('UNIT_PROPS_VALUE_MISMATCH')
+          print('EXACT_R4_COMPONENTS_AND_PYTHON_SYNTAX_VERIFIED='+str(len(files)))
+          PY
+
+      - name: Run targeted T2-like systemd, memory, CPU and nft network rehearsal
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          block() { record BLOCKED "$1"; echo "G3_STATUS=BLOCKED REASON=$1"; exit 20; }
+          STAGE="$GITHUB_WORKSPACE/source"
+          RECEIPT="$RUNNER_TEMP/st01r-g3-${ATTEMPT_ID}.jsonl"
+          : > "$RECEIPT"; chmod 600 "$RECEIPT"
+          record() {
+            python3 - "$RECEIPT" "$ATTEMPT_ID" "$1" "$2" <<'PY'
+          import datetime,json,os,sys
+          p,attempt,event,status=sys.argv[1:]
+          row={'attempt_id':attempt,'utc':datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds').replace('+00:00','Z'),'event':event,'status':status}
+          fd=os.open(p,os.O_WRONLY|os.O_APPEND|os.O_NOFOLLOW)
+          with os.fdopen(fd,'a',encoding='utf-8') as f: f.write(json.dumps(row,sort_keys=True,separators=(',',':'))+'\n'); f.flush(); os.fsync(f.fileno())
+          PY
+          }
+          FINAL_RESULT=BLOCKED
+          finish() {
+            rc=$?
+            trap - EXIT
+            if [[ -f "$RECEIPT" ]]; then
+              if ! record FINAL "${FINAL_RESULT:-BLOCKED}"; then
+                echo 'G3_STATUS=BLOCKED REASON=RECEIPT_FINAL_WRITE_FAILED'
+                exit 20
+              fi
+              final_sha=$(sha256sum -- "$RECEIPT" | awk '{print $1}') || {
+                echo 'G3_STATUS=BLOCKED REASON=RECEIPT_FINAL_SHA_FAILED'
+                exit 20
+              }
+              [[ "$final_sha" =~ ^[0-9a-f]{64}$ ]] || {
+                echo 'G3_STATUS=BLOCKED REASON=RECEIPT_FINAL_SHA_INVALID'
+                exit 20
+              }
+              echo 'G3_RECEIPT_BEGIN'
+              if ! cat "$RECEIPT"; then
+                echo 'G3_STATUS=BLOCKED REASON=RECEIPT_READ_FAILED'
+                exit 20
+              fi
+              echo 'G3_RECEIPT_END'
+              echo "G3_RECEIPT_SHA256=$final_sha"
+            fi
+            exit "$rc"
+          }
+          trap finish EXIT
+          record INPUT_NFT_SHA "$EXPECTED_NFT_SHA256"
+          record INPUT_PROPS_SHA "$EXPECTED_PROPS_SHA256"
+          for f in source/host/probes/cgroup_utils.py source/host/probes/cgroup_probe.py source/host/probes/memory_probe.py source/host/probes/cpu_probe.py source/host/probes/network_probe.py source/host/probes/nft_rules.py source/host/probes/unit_runner.py; do record "INPUT_$(basename "$f")" "$(sha256sum "$f" | awk '{print $1}')"; done
+          record ATTEMPT "$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT"
+          command -v useradd >/dev/null || block USERADD_MISSING
+          getent passwd watson-s1 >/dev/null && block WATSON_USER_EXISTS
+          getent passwd ubuntu >/dev/null && block UBUNTU_CONTROL_USER_EXISTS
+          sudo -n useradd --system --no-create-home --shell /usr/sbin/nologin watson-s1 || block WATSON_USER_CREATE_FAILED
+          sudo -n useradd --system --no-create-home --shell /usr/sbin/nologin ubuntu || block CONTROL_USER_CREATE_FAILED
+          uid="$(id -u watson-s1)"; [[ "$uid" =~ ^[0-9]+$ ]] || block WATSON_UID_UNKNOWN
+          sudo -n install -d -o root -g root -m 0755 /opt/watson-s1 /opt/watson-s1/host /opt/watson-s1/host/probes
+          sudo -n install -d -o root -g root -m 0755 /var/lib/watson-s1
+          sudo -n install -d -o watson-s1 -g watson-s1 -m 0700 /var/lib/watson-s1/runs
+          for f in cgroup_utils.py cgroup_probe.py memory_probe.py cpu_probe.py network_probe.py nft_rules.py unit_runner.py; do sudo -n install -o root -g root -m 0644 "$STAGE/host/probes/$f" "/opt/watson-s1/host/probes/$f" || block "INSTALL_PROBE_$f"; done
+          sudo -n install -o root -g root -m 0644 "$STAGE/host/watson_s1_unit.props" /opt/watson-s1/host/watson_s1_unit.props
+          sudo -n install -o root -g root -m 0644 "$STAGE/host/watson_s1_egress.nft" /opt/watson-s1/host/watson_s1_egress.nft
+          PROPS=/opt/watson-s1/host/watson_s1_unit.props
+          UNIT_RUNNER=/opt/watson-s1/host/probes/unit_runner.py
+          PYTHON="$(command -v python3)"
+          unit_probe() {
+            local name="$1" runtime="$2" probe="$3" expected="$4"; shift 4
+            local out rc
+            if out="$(sudo -n python3 "$UNIT_RUNNER" --unit "$name" --runtime "$runtime" --props "$PROPS" "$@" -- "$PYTHON" -B "/opt/watson-s1/host/probes/$probe" 2>&1)"; then rc=0; else rc=$?; fi
+            printf '%s\n' "$out"
+            [[ $rc -eq 0 ]] || block "UNIT_RUNNER_$name"
+            unitfile="$RUNNER_TEMP/${name}.json"; printf '%s' "$out" > "$unitfile"
+            python3 - "$unitfile" "$expected" "$probe" <<'PY'
+          import json,os,sys
+          d=json.load(open(sys.argv[1])); assert d.get('status')=='PASS' and d.get('exit_code')==0
+          rows=[x for x in d.get('stdout','').splitlines() if x.strip()]; assert rows
+          x=json.loads(rows[-1]); assert x.get('status')==sys.argv[2]
+          if sys.argv[3]=='memory_probe.py':
+              assert x.get('child_sigkill') is True and x.get('memory_max')==os.environ['EXPECTED_MEMORY_MAX_BYTES']
+              ev=x.get('memory_events_delta',{}); assert ev.get('oom_kill',0)>=1 and ev.get('max',0)>=1
+          if sys.argv[3]=='cpu_probe.py':
+              assert x.get('cpu_max')==os.environ['EXPECTED_CPU_MAX'] and x.get('nr_throttled_delta',0)>0
+          print('INNER_STATUS='+x['status'])
+          PY
+            record "UNIT_$name" PASS
+          }
+          unit_probe "watson-s1-g3-${GITHUB_RUN_ID}-cgroup.service" 20 cgroup_probe.py PASS
+          swap_kb="$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo)"; memopts=()
+          if ((swap_kb>0)); then memopts+=(--swap-zero); fi
+          unit_probe "watson-s1-g3-${GITHUB_RUN_ID}-memory.service" 40 memory_probe.py PASS --oom-policy continue "${memopts[@]}"
+          unit_probe "watson-s1-g3-${GITHUB_RUN_ID}-cpu.service" 30 cpu_probe.py PASS
+          nft_src=/opt/watson-s1/host/watson_s1_egress.nft
+          nft_helper=/opt/watson-s1/host/probes/nft_rules.py
+          if nft_existing="$(sudo -n nft list table inet watson_s1_egress 2>&1)"; then block NFT_TABLE_ALREADY_EXISTS
+          else grep -qiE 'No such file or directory|does not exist' <<<"$nft_existing" || block NFT_TABLE_ABSENCE_UNPROVEN; fi
+          rendered="$RUNNER_TEMP/watson_s1_egress.numeric.nft"
+          sed "s/__WATSON_S1_UID__/$uid/" "$nft_src" > "$rendered" || block NFT_RENDER_FAILED
+          [[ "$(grep -c "$uid jump collector" "$rendered")" == 1 ]] || block NFT_UID_BINDING_FAILED
+          sudo -n nft -c -f "$rendered" || block NFT_CHECK_FAILED
+          sudo -n nft -f "$rendered" || block NFT_APPLY_FAILED
+          sudo -n python3 "$nft_helper" --uid "$uid" --source "$nft_src" >/dev/null || block NFT_READBACK_FAILED
+          record NFT_TABLE_APPLIED_ON_EPHEMERAL_GITHUB_VM PASS
+          snapshot() { sudo -n python3 "$nft_helper" --uid "$uid" --source "$nft_src" > "$1" || block NFT_SNAPSHOT_FAILED; }
+          counter() { sudo -n python3 "$nft_helper" --uid "$uid" --source "$nft_src" --assert-delta "$1" "$2" "$3" || block "NFT_COUNTER_DELTA_$3"; }
+          network_case() {
+            local test="$1" rule="$2" mode="$3" before after out rc
+            before="$RUNNER_TEMP/${test}.before.json"; after="$RUNNER_TEMP/${test}.after.json"
+            snapshot "$before"
+            if out="$(sudo -n python3 "$UNIT_RUNNER" --unit "watson-s1-g3-${GITHUB_RUN_ID}-${test}.service" --runtime 15 --props "$PROPS" -- "$PYTHON" -B /opt/watson-s1/host/probes/network_probe.py "$test" 2>&1)"; then rc=0; else rc=$?; fi
+            printf '%s\n' "$out"; [[ $rc -eq 0 ]] || block "NETWORK_UNIT_$test"
+            printf '%s' "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d.get("status")=="PASS" and d.get("exit_code")==0; rows=[x for x in d.get("stdout","").splitlines() if x.strip()]; assert rows; x=json.loads(rows[-1]); mode=sys.argv[1];
+          assert x.get("status") in ("PASS","ATTEMPTED");
+          assert (x.get("status")=="PASS") if mode=="dns" else True;
+          assert x.get("connected") is True if mode=="allow" else True;
+          assert x.get("connected") is False if mode=="deny" else True;
+          assert x.get("status")=="ATTEMPTED" if mode=="child-deny" else True;
+          assert x.get("child",{}).get("attempted") is True if mode=="child-deny" else True;
+          assert x.get("child",{}).get("connected") is False if mode=="child-deny" else True;
+          print("NETWORK_INNER_STATUS="+x["status"])' "$mode" || block "NETWORK_RESULT_INVALID_$test"
+            snapshot "$after"; counter "$before" "$after" "$rule"
+            record "NETWORK_$test" PASS
+          }
+          network_case dns-stub dns-any dns
+          network_case allow-tcp443 collector:6 allow
+          network_case block-tcp80 collector:7 deny
+          network_case block-udp53 collector:7 attempted
+          network_case block-tcp53 collector:7 deny
+          network_case block-metadata80 collector:2 deny
+          network_case block-metadata443 collector:2 deny
+          network_case block-rfc1918-443 collector:4 deny
+          network_case child-block-tcp80 collector:7 child-deny
+          ipv6_state=enabled; [[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6)" == 0 ]] || ipv6_state=disabled
+          record IPV6_STATE "$ipv6_state"
+          if [[ "$ipv6_state" == enabled ]]; then
+            network_case ipv6-loopback80 collector:5 deny
+            link6="$( (awk 'tolower($1) ~ /^fe80/ && NF>=6 {print $6}' /proc/net/if_inet6 2>/dev/null || true) | sort -u)"
+            if [[ -n "$link6" ]]; then network_case ipv6-linklocal443 collector:3 deny; else record IPV6_LINKLOCAL NOT_TESTABLE; fi
+            if ip -6 route get 2606:4700:4700::1111 >/dev/null 2>&1; then
+              network_case ipv6-public80 collector:7 deny
+              network_case ipv6-public53-tcp collector:7 deny
+              network_case ipv6-public53-udp collector:7 attempted
+            else record IPV6_GLOBAL_ROUTE NOT_TESTABLE; fi
+          else
+            record IPV6_TESTS NOT_TESTABLE
+          fi
+          cb="$RUNNER_TEMP/control.before.json"; ca="$RUNNER_TEMP/control.after.json"
+          snapshot "$cb"
+          sudo -n -u ubuntu env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin ST01R_CONTROL_ARMED=YES "$PYTHON" -B /opt/watson-s1/host/probes/network_probe.py control-ubuntu-tcp80 > "$RUNNER_TEMP/control.json" || block UBUNTU_CONTROL_FAILED
+          python3 - "$RUNNER_TEMP/control.json" <<'PY'
+          import json,os,sys
+          d=json.load(open(sys.argv[1])); assert d.get('status')=='ATTEMPTED' and d.get('connected') is True
+          PY
+          snapshot "$ca"; counter "$cb" "$ca" unchanged; record UBUNTU_SCOPE_CONTROL PASS
+          if [[ "$ipv6_state" == enabled && -n "${link6:-}" ]] && ip -6 route get 2606:4700:4700::1111 >/dev/null 2>&1; then result=PASS; else result=PARTIAL; fi
+          FINAL_RESULT="$result"
+          record FINAL_STATUS "$result"
+          echo "G3_GITHUB_VM_STATUS=$result ATTEMPT_ID=$ATTEMPT_ID RUN_ID=$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT"
+          echo 'G3_SCOPE=GitHub-hosted ephemeral VM only; not OVH qualification; no S1 authorization'
+          [[ "$result" == PASS ]] || exit 10
